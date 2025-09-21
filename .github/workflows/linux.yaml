@@ -1,0 +1,85 @@
+name: llm
+on:
+  pull_request:
+    paths-ignore:
+      - "**.md"
+
+# Every time you make a push to your PR, it cancel immediately the previous checks,
+# and start a new one. The other runner will be available more quickly to your PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.model }}-${{ matrix.backend }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            backend: lerobot-smolvla
+            group: vla
+            model: lerobot/smolvla_base
+    env:
+      RENAME_FN: |
+        rename_samples_task_file() {
+          task="$1"
+          f="quality-results/samples_${task}_"*.jsonl
+          f=$(basename $f)
+          ts="${f#samples_${task}_}"; ts="${ts%.jsonl}"
+          mv quality-results/samples_${task}_* quality-results/${task}_${{ matrix.backend }}_samples_$ts.jsonl
+        }
+      MODEL_ID: ${{ matrix.model }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write model slug to env
+        shell: bash
+        run: |
+          MODEL_SLUG=${MODEL_ID//\//_}
+          echo "MODEL_SLUG=$MODEL_SLUG" >> "$GITHUB_ENV"
+
+      - name: Install deps lerobot/smolvla
+        env:
+          HF_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+          HF_HUB_ENABLE_HF_TRANSFER: "1"
+        if: ${{ matrix.backend == 'lerobot-smolvla' }}
+        shell: bash
+        run: |
+          # option for egl
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgles2 libgbm1
+
+          pip install -r requirements/vla.txt
+
+      - name: Help for lerobot/smolvla
+        if: ${{ matrix.backend == 'lerobot-smolvla' }}
+        shell: bash
+        run: |
+          lerobot-eval --help
+
+      - name: Benchmarking lerobot/smolvla
+        if: ${{ matrix.backend == 'lerobot-smolvla' }}
+        shell: bash
+        run: |
+          export MUJOCO_GL=egl
+          export PYOPENGL_PLATFORM=egl
+          printf 'N\n' | lerobot-eval \
+            --policy.path=${MODEL_ID} \
+            --policy.device=cpu \
+            --env.type=libero \
+            --env.task=libero_object \
+            --eval.n_episodes=1 \
+            --eval.batch_size=1 \
+            --output vla-results/${MODEL_SLUG}.json
+
+      - name: Upload benchmark and reports
+        if: ${{ matrix.group != 'vla' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux_logs_${{ env.MODEL_SLUG }}_${{ matrix.backend }}_${{ github.event.pull_request.head.sha }}
+          path: |
+            vla-results/*.json
