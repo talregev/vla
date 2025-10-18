@@ -19,9 +19,13 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            backend: lerobot-smolvla
-            group: vla
+            backend: lerobot-gymrobotic-smolvla
+            group: train
             model: lerobot/smolvla_base
+          # - os: ubuntu-latest
+          #   backend: gym
+          #   group: vla
+          #   model: lerobot/smolvla_base
     env:
       RENAME_FN: |
         rename_samples_task_file() {
@@ -42,6 +46,138 @@ jobs:
           MODEL_SLUG=${MODEL_ID//\//_}
           echo "MODEL_SLUG=$MODEL_SLUG" >> "$GITHUB_ENV"
 
+      - name: Install deps lerobot-gymnasium-robotics-smolvla
+        env:
+          HF_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+          HF_HUB_ENABLE_HF_TRANSFER: "1"
+        if: ${{ matrix.backend == 'lerobot-gymrobotic-smolvla' }}
+        shell: bash
+        run: |
+          # option for egl
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgles2 libgbm1
+
+          # pip install "lerobot[gymnasium-robotics,smolvla] @ git+https://github.com/talregev/lerobot.git@TalR/test" --extra-index-url https://download.pytorch.org/whl/cpu
+          pip install "lerobot[gymnasium-robotics,smolvla,grpcio-dep] @ git+https://github.com/talregev/lerobot.git@TalR/gym_robotics" --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: train
+        if: ${{ matrix.group == 'train' }}
+        shell: bash
+        run: |
+
+          mkdir -p dataset/online-buffer
+          mkdir -p dataset/meta
+
+          cat > "train_cfg.json" <<'JSON'
+          {
+              "job_name": "hilserl_fetch_pick_v4_cpu",
+              "seed": 0,
+              "env": {
+                  "type": "gymnasium-robotics",
+                  "task": "FetchPickAndPlace-v4",
+                  "episode_length": 200,
+                  "features_map": {
+                      "action": "action",
+                      "agent_pos": "observation.state",
+                      "top": "observation.image",
+                      "pixels/top": "observation.image"
+                  },
+                  "features": {
+                      "action": {
+                          "type": "ACTION",
+                          "shape": [
+                              4
+                          ]
+                      },
+                      "agent_pos": {
+                          "type": "STATE",
+                          "shape": [
+                              4
+                          ]
+                      },
+                      "pixels/top": {
+                          "type": "VISUAL",
+                          "shape": [
+                              480,
+                              480,
+                              3
+                          ]
+                      }
+                  }
+              },
+              "policy": {
+                  "type": "sac",
+                  "device": "cpu",
+                  "concurrency": {
+                      "actor": "threads",
+                      "learner": "threads"
+                  },
+                  "repo_id": "None",
+                  "push_to_hub": false
+              },
+              "dataset": { 
+                  "repo_id": "online-buffer",
+                  "root": "${{ github.workspace }}/dataset",
+                  "use_imagenet_stats": true
+              }
+          }
+          JSON
+
+
+          cat > "dataset/meta/info.json" <<'JSON'
+          {
+            "features": {},
+            "codebase_version": "v3.0"
+          }
+          JSON
+
+          export MUJOCO_GL=egl
+          export PYOPENGL_PLATFORM=egl
+          export HF_HUB_OFFLINE=1
+          export HF_HUB_DISABLE_TELEMETRY=1
+          export HF_DATASETS_OFFLINE=1
+          export WANDB_MODE=disabled
+
+          # Launch learner and actor (one shell)
+          python -m lerobot.rl.learner --config_path "train_cfg.json"
+          python -m lerobot.rl.actor   --config_path "train_cfg.json"
+
+      - name: Benchmarking lerobot-gymnasium-robotics-smolvla
+        if: ${{ matrix.backend == 'lerobot-gymrobotic-smolvla' }}
+        shell: bash
+        run: |
+          export MUJOCO_GL=egl
+          export PYOPENGL_PLATFORM=egl
+
+          printf 'N\n' | lerobot-eval \
+            --policy.path=lerobot/smolvla_base \
+            --policy.device=cpu \
+            --policy.n_action_steps=1000 \
+            --policy.chunk_size=1000 \
+            --env.episode_length=1000 \
+            --env.max_state_dim=32 \
+            --env.type=gymnasium-robotics \
+            --env.task=Ant-v5 \
+            --eval.n_episodes=1 \
+            --eval.batch_size=1 \
+            --rename_map='{"observation.image": "observation.images.camera1"}' \
+            --policy.output_features='{"action":{"type":"ACTION","shape":[8]}}' \
+            --output vla-results/Ant-v5
+
+          printf 'N\n' | lerobot-eval \
+            --policy.path=lerobot/smolvla_base \
+            --policy.device=cpu \
+            --policy.n_action_steps=1000 \
+            --policy.chunk_size=1000 \
+            --env.episode_length=1000 \
+            --env.type=gymnasium-robotics \
+            --env.task=FetchPickAndPlace-v4 \
+            --eval.n_episodes=1 \
+            --eval.batch_size=1 \
+            --rename_map='{"observation.image": "observation.images.camera1"}' \
+            --policy.output_features='{"action":{"type":"ACTION","shape":[4]}}' \
+            --output vla-results/FetchPickAndPlace-v4
+
       - name: Install deps lerobot/smolvla
         env:
           HF_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
@@ -55,12 +191,6 @@ jobs:
 
           pip install -r requirements/vla.txt
 
-      - name: Help for lerobot/smolvla
-        if: ${{ matrix.backend == 'lerobot-smolvla' }}
-        shell: bash
-        run: |
-          lerobot-eval --help
-
       - name: Benchmarking lerobot/smolvla
         if: ${{ matrix.backend == 'lerobot-smolvla' }}
         shell: bash
@@ -68,18 +198,24 @@ jobs:
           export MUJOCO_GL=egl
           export PYOPENGL_PLATFORM=egl
           printf 'N\n' | lerobot-eval \
-            --policy.path=${MODEL_ID} \
+            --policy.path=lerobot/smolvla_base \
             --policy.device=cpu \
             --env.type=libero \
             --env.task=libero_object \
             --eval.n_episodes=1 \
             --eval.batch_size=1 \
-            --output vla-results/${MODEL_SLUG}.json
+            --policy.input_features='{"observation.image":{"type":"VISUAL","shape":[3,256,256]}}' \
+            --policy.output_features='{"action":{"type":"ACTION","shape":[4]}}' \
+            --output vla-results/smolvla_libero_cpu.json
+
+      - name: Help for lerobot/smolvla
+        shell: bash
+        run: |
+          lerobot-eval --help
 
       - name: Upload benchmark and reports
-        if: ${{ matrix.group != 'vla' }}
         uses: actions/upload-artifact@v4
         with:
           name: linux_logs_${{ env.MODEL_SLUG }}_${{ matrix.backend }}_${{ github.event.pull_request.head.sha }}
           path: |
-            vla-results/*.json
+            vla-results/*
